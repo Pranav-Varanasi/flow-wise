@@ -21,18 +21,18 @@ from backend.models.schemas import (
 from backend.llm.claude_client import ClaudeClient
 from backend.agents.scope_agent import ScopeAgent
 from backend.agents.mode_selection_agent import ModeSelectionAgent
-from backend.agents.auto_pilot_agent import AutoPilotAgent
+from backend.agents.auto_pilot_blocks_agent import AutoPilotBlocksAgent
 from backend.agents.business_requirement_agent import BusinessRequirementAgent
 from backend.agents.guided_agent import GuidedAgent
 from backend.agents.smart_guided_agent import SmartGuidedAgent
 from backend.agents.conversational_guided_agent import ConversationalGuidedAgent
-from backend.agents.analysis_blocks_agent import AnalysisBlocksAgent
-from backend.agents.analysis_confidence_agent import AnalysisConfidenceAgent
+from backend.agents.guided_analysis_agent import GuidedAnalysisAgent
 from backend.agents.question_loop_agent import QuestionLoopAgent
 from backend.agents.template_agent import TemplateAgent
 from backend.agents.reasoning_agent import ReasoningAgent
 from pydantic import ValidationError
 from backend.utils.guided_loop_store import GuidedLoopStore
+from backend.utils.analysis_consistency import check_analysis_blocks_consistency
 
 router = APIRouter(prefix="/api", tags=["architecture"])
 
@@ -96,13 +96,46 @@ async def select_mode(req: ModeRequest):
 @router.post("/auto/init", response_model=AutoPilotInitResponse)
 async def auto_init(req: AutoPilotInitRequest):
     try:
-        client = _get_client()
-        agent = AutoPilotAgent(client)
-        result = await agent.run(
-            user_input=req.user_input,
-            scope=req.scope.model_dump(),
+        # Auto-pilot init is deterministic: show confirmed detections from scope + ask 3 fixed questions.
+        scope = req.scope.model_dump()
+        confirmed = {
+            "app_type": scope.get("app_type", "web"),
+            "stack": scope.get("stack", []),
+            "architecture_pattern": "three-tier",
+            "session_store": "stateless",
+            "deployment_model": "cloud-native",
+        }
+        missing_fields = [
+            {
+                "id": "users",
+                "label": "Expected Users",
+                "question": "How many concurrent users do you expect at peak?",
+                "placeholder": "e.g., 500, 10000, 1M",
+                "type": "text",
+                "options": [],
+            },
+            {
+                "id": "visibility",
+                "label": "Visibility",
+                "question": "Will this application be accessible from the internet?",
+                "placeholder": "",
+                "type": "select",
+                "options": ["public", "internal", "both"],
+            },
+            {
+                "id": "uptime",
+                "label": "Uptime Requirement",
+                "question": "What uptime level does your business need?",
+                "placeholder": "",
+                "type": "select",
+                "options": ["99%", "99.9%", "99.99%", "99.999%"],
+            },
+        ]
+        return AutoPilotInitResponse(
+            confirmed_detections=confirmed,
+            missing_fields=missing_fields,
+            architecture_hint="Answer 3 questions and Auto Pilot will generate the full architecture.",
         )
-        return AutoPilotInitResponse(**result)
     except HTTPException:
         raise
     except Exception as exc:
@@ -114,17 +147,105 @@ async def auto_complete(req: AutoPilotCompleteRequest):
     try:
         client = _get_client()
 
-        analysis_blocks = await _validated_analysis_blocks(
-            client,
-            user_input=req.user_input,
-            scope=req.scope.model_dump(),
-            previous_answers={
-                "users": req.quick_inputs.users,
-                "visibility": req.quick_inputs.visibility,
-                "uptime": req.quick_inputs.uptime,
-                **(req.auto_pilot_init.confirmed_detections.model_dump() if req.auto_pilot_init else {}),
-            },
-        )
+        # Deterministic derivations from the 3 quick inputs.
+        users_num = _parse_users(str(req.quick_inputs.users))
+        if users_num < 100:
+            users_band = "under_100"
+        elif users_num < 1000:
+            users_band = "100_to_1k"
+        elif users_num < 10_000:
+            users_band = "1k_to_10k"
+        elif users_num < 100_000:
+            users_band = "10k_to_100k"
+        else:
+            users_band = "100k_plus"
+
+        uptime_raw = str(req.quick_inputs.uptime or "").strip()
+        if uptime_raw == "99%":
+            sla_target = "best_effort"
+        elif uptime_raw == "99.9%":
+            sla_target = "99.9"
+        else:
+            # Treat 99.99% and 99.999% (and any unknown high-uptime) as 99.99.
+            sla_target = "99.99"
+
+        visibility_raw = str(req.quick_inputs.visibility or "").strip().lower()
+        if visibility_raw == "internal":
+            public_facing = False
+        else:
+            # public | both | unknown -> true
+            public_facing = True
+
+        confirmed = {
+            "users": req.quick_inputs.users,
+            "visibility": req.quick_inputs.visibility,
+            "uptime": req.quick_inputs.uptime,
+            # Pass deterministic, schema-level hints so the LLM cannot "mis-map" them.
+            "concurrent_users_band": users_band,
+            "sla_target": sla_target,
+            "public_facing": public_facing,
+            **(req.auto_pilot_init.confirmed_detections.model_dump() if req.auto_pilot_init else {}),
+        }
+
+        blocks_agent = AutoPilotBlocksAgent(client)
+        last_err: Exception | None = None
+        raw_blocks: dict = {}
+        for _attempt in range(3):
+            raw_blocks = await blocks_agent.run(
+                user_input=req.user_input,
+                scope=req.scope.model_dump(),
+                confirmed=confirmed,
+            )
+            # Hard-apply deterministic mappings from the 3 quick inputs.
+            # This guarantees the final 7-block JSON cannot contradict user-confirmed answers.
+            try:
+                raw_blocks.setdefault("analysis_block_4_traffic_and_scale", {})["concurrent_users_band"] = users_band
+                raw_blocks.setdefault("analysis_block_5_availability", {})["sla_target"] = sla_target
+                raw_blocks.setdefault("analysis_block_6_access_and_security", {})["public_facing"] = public_facing
+            except Exception:
+                # If the model returned a malformed shape, let validation handle it.
+                pass
+            try:
+                analysis_blocks = GuidedAnalysisBlocks(**raw_blocks)
+                violations = check_analysis_blocks_consistency(analysis_blocks)
+                if not violations:
+                    break
+                last_err = Exception("Consistency violations: " + "; ".join(vv.message for vv in violations))
+                confirmed = {
+                    **confirmed,
+                    "_instructions": (
+                        "Your previous JSON violated consistency rules. Output corrected JSON ONLY. "
+                        "Change only the minimum fields needed to satisfy the listed violations; keep everything else identical."
+                    ),
+                    "_previous_json": raw_blocks,
+                    "_consistency_violations": [vv.message for vv in violations],
+                }
+            except ValidationError as exc:
+                last_err = exc
+                confirmed = {
+                    **confirmed,
+                    "_validation_error": str(exc),
+                    "_instructions": (
+                        "Your previous JSON failed schema validation. Output corrected JSON ONLY. "
+                        "Change only the minimum fields needed to satisfy the error; keep everything else identical."
+                    ),
+                    "_previous_json": raw_blocks,
+                    "_consistency_violations": [vv.message for vv in (violations if "violations" in locals() else [])],
+                }
+            except Exception as exc:
+                last_err = exc
+                confirmed = {
+                    **confirmed,
+                    "_instructions": (
+                        "Your previous JSON violated consistency rules. Output corrected JSON ONLY. "
+                        "Change only the minimum fields needed to satisfy the listed violations; keep everything else identical."
+                    ),
+                    "_previous_json": raw_blocks,
+                    "_consistency_violations": [vv.message for vv in (violations if "violations" in locals() else [])],
+                }
+        else:
+            raise HTTPException(status_code=500, detail=f"Auto-pilot blocks validation failed: {last_err}")
+
         requirements = _analysis_blocks_to_requirements(analysis_blocks, req.scope.model_dump())
 
         tmpl_agent = TemplateAgent(client)
@@ -174,11 +295,11 @@ async def guided_complete(req: GuidedCompleteRequest):
             if isinstance(block_answers, dict):
                 flat_answers.update(block_answers)
 
-        analysis_blocks = await _validated_analysis_blocks(
+        analysis_blocks = await _validated_guided_analysis_blocks(
             client,
             user_input=req.user_input,
             scope=req.scope.model_dump(),
-            previous_answers=flat_answers,
+            answers=flat_answers,
         )
         requirements = _analysis_blocks_to_requirements(analysis_blocks, req.scope.model_dump())
 
@@ -228,11 +349,11 @@ async def smart_guided_complete(req: SmartGuidedCompleteRequest):
     """
     try:
         client = _get_client()
-        analysis_blocks = await _validated_analysis_blocks(
+        analysis_blocks = await _validated_guided_analysis_blocks(
             client,
             user_input=req.user_input,
             scope=req.scope.model_dump(),
-            previous_answers=req.answers,
+            answers=req.answers,
         )
         requirements = _analysis_blocks_to_requirements(analysis_blocks, req.scope.model_dump())
 
@@ -288,15 +409,44 @@ async def guided_loop_start(req: GuidedLoopStartRequest):
         client = _get_client()
         session_id = _guided_loop_store.new_session_id()
 
-        analysis_agent = AnalysisConfidenceAgent(client)
-        analysis_raw = await analysis_agent.run(
-            user_input=req.user_input,
-            scope=req.scope.model_dump(),
-            answers={},
-        )
-
-        confidence = analysis_raw.get("confidence", {})
-        blocks_raw = {k: v for k, v in analysis_raw.items() if k != "confidence"}
+        analysis_agent = GuidedAnalysisAgent(client)
+        analysis_raw: dict = {}
+        last_err: Exception | None = None
+        answers: dict = {}
+        for _attempt in range(2):
+            analysis_raw = await analysis_agent.run(
+                user_input=req.user_input,
+                scope=req.scope.model_dump(),
+                answers=answers,
+            )
+            confidence = analysis_raw.get("confidence", {})
+            blocks_raw = {k: v for k, v in analysis_raw.items() if k != "confidence"}
+            try:
+                blocks_model = GuidedAnalysisBlocks(**blocks_raw)
+                violations = check_analysis_blocks_consistency(blocks_model)
+                if violations:
+                    last_err = Exception("Consistency violations: " + "; ".join(vv.message for vv in violations))
+                    raise last_err
+                break
+            except ValidationError as exc:
+                last_err = exc
+                answers = {
+                    **(answers or {}),
+                    "_validation_error": str(exc),
+                    "_instructions": "Your previous JSON failed schema validation. Output corrected JSON ONLY, using allowed enum values and correct types.",
+                    "_previous_json": blocks_raw,
+                    "_consistency_violations": [vv.message for vv in (violations if "violations" in locals() else [])],
+                }
+            except Exception as exc:
+                last_err = exc
+                answers = {
+                    **(answers or {}),
+                    "_instructions": "Your previous JSON violated consistency rules. Output corrected JSON ONLY.",
+                    "_previous_json": blocks_raw,
+                    "_consistency_violations": [vv.message for vv in (violations if "violations" in locals() else [])],
+                }
+        else:
+            raise HTTPException(status_code=500, detail=f"Guided loop start validation failed: {last_err}")
 
         q_agent = QuestionLoopAgent(client)
         q_raw = await q_agent.run(
@@ -315,7 +465,7 @@ async def guided_loop_start(req: GuidedLoopStartRequest):
             answers={},
             question_count=0,
             max_questions=req.max_questions,
-            analysis_blocks=GuidedAnalysisBlocks(**blocks_raw),
+            analysis_blocks=blocks_model,
             confidence=AnalysisConfidence(**confidence) if confidence else None,
             status="questioning",
         )
@@ -340,8 +490,6 @@ async def guided_loop_start(req: GuidedLoopStartRequest):
             analysis_blocks=state.analysis_blocks,
             confidence=state.confidence,
         )
-    except ValidationError as exc:
-        raise HTTPException(status_code=500, detail=f"Guided loop start validation failed: {exc}") from exc
     except HTTPException:
         raise
     except Exception as exc:
@@ -376,15 +524,50 @@ async def guided_loop_answer(req: GuidedLoopAnswerRequest):
         state.question_count += 1
 
         client = _get_client()
-        analysis_agent = AnalysisConfidenceAgent(client)
-        analysis_raw = await analysis_agent.run(
-            user_input=state.user_input,
-            scope=state.scope.model_dump(),
-            answers=state.answers,
-        )
-        confidence = analysis_raw.get("confidence", {})
-        blocks_raw = {k: v for k, v in analysis_raw.items() if k != "confidence"}
-        state.analysis_blocks = GuidedAnalysisBlocks(**blocks_raw)
+        # Provide previous low-confidence fields to encourage monotonic improvement per prompt rule.
+        prev_low = []
+        if state.confidence and state.confidence.low_confidence_fields:
+            prev_low = list(state.confidence.low_confidence_fields)
+
+        analysis_agent = GuidedAnalysisAgent(client)
+        analysis_raw: dict = {}
+        last_err: Exception | None = None
+        answers = {**state.answers, "_previous_low_confidence_fields": prev_low}
+        for _attempt in range(2):
+            analysis_raw = await analysis_agent.run(
+                user_input=state.user_input,
+                scope=state.scope.model_dump(),
+                answers=answers,
+            )
+            confidence = analysis_raw.get("confidence", {})
+            blocks_raw = {k: v for k, v in analysis_raw.items() if k != "confidence"}
+            try:
+                state.analysis_blocks = GuidedAnalysisBlocks(**blocks_raw)
+                violations = check_analysis_blocks_consistency(state.analysis_blocks)
+                if violations:
+                    last_err = Exception("Consistency violations: " + "; ".join(vv.message for vv in violations))
+                    raise last_err
+                break
+            except ValidationError as exc:
+                last_err = exc
+                answers = {
+                    **answers,
+                    "_validation_error": str(exc),
+                    "_instructions": "Your previous JSON failed schema validation. Output corrected JSON ONLY, using allowed enum values and correct types.",
+                    "_previous_json": blocks_raw,
+                    "_consistency_violations": [vv.message for vv in (violations if "violations" in locals() else [])],
+                }
+            except Exception as exc:
+                last_err = exc
+                answers = {
+                    **answers,
+                    "_instructions": "Your previous JSON violated consistency rules. Output corrected JSON ONLY.",
+                    "_previous_json": blocks_raw,
+                    "_consistency_violations": [vv.message for vv in (violations if "violations" in locals() else [])],
+                }
+        else:
+            raise HTTPException(status_code=500, detail=f"Guided loop answer validation failed: {last_err}")
+
         state.confidence = AnalysisConfidence(**confidence) if confidence else None
 
         q_agent = QuestionLoopAgent(client)
@@ -441,11 +624,11 @@ async def guided_analysis(req: GuidedAnalysisRequest):
     """
     try:
         client = _get_client()
-        return await _validated_analysis_blocks(
+        return await _validated_guided_analysis_blocks(
             client,
             user_input=req.user_input,
             scope=req.scope.model_dump(),
-            previous_answers=req.answers,
+            answers=req.answers,
         )
     except HTTPException:
         raise
@@ -556,36 +739,51 @@ def _analysis_blocks_to_requirements(blocks: GuidedAnalysisBlocks, scope: dict) 
     }
 
 
-async def _validated_analysis_blocks(
+async def _validated_guided_analysis_blocks(
     client: ClaudeClient,
     *,
     user_input: str,
     scope: dict,
-    previous_answers: dict,
-    max_attempts: int = 2,
+    answers: dict,
+    max_attempts: int = 3,
 ) -> GuidedAnalysisBlocks:
     """
-    Ask the LLM for analysis blocks and validate via Pydantic.
+    Ask the GuidedAnalysisAgent for 7-blocks (+ confidence) and validate blocks via Pydantic.
     If validation fails, retry once with the validation error so the LLM can correct enums/types.
-    This avoids hardcoded fixups while keeping the server resilient.
     """
-    agent = AnalysisBlocksAgent(client)
+    agent = GuidedAnalysisAgent(client)
     last_err: Exception | None = None
     raw: dict = {}
-    for attempt in range(max_attempts):
-        raw = await agent.run(user_input=user_input, scope=scope, previous_answers=previous_answers)
+
+    for _attempt in range(max_attempts):
+        raw = await agent.run(user_input=user_input, scope=scope, answers=answers)
+        blocks_raw = {k: v for k, v in raw.items() if k != "confidence"}
         try:
-            return GuidedAnalysisBlocks(**raw)
+            blocks = GuidedAnalysisBlocks(**blocks_raw)
+            violations = check_analysis_blocks_consistency(blocks)
+            if violations:
+                last_err = Exception("Consistency violations: " + "; ".join(vv.message for vv in violations))
+                raise last_err
+            return blocks
         except ValidationError as exc:
             last_err = exc
-            # Ask the model to correct its previous JSON exactly.
-            previous_answers = {
-                **(previous_answers or {}),
+            answers = {
+                **(answers or {}),
                 "_validation_error": str(exc),
                 "_instructions": "Your previous JSON failed schema validation. Output corrected JSON ONLY, using allowed enum values and correct types.",
-                "_previous_json": raw,
+                "_previous_json": blocks_raw,
+                "_consistency_violations": [vv.message for vv in (violations if "violations" in locals() else [])],
             }
-    raise HTTPException(status_code=500, detail=f"Analysis block validation failed: {last_err}")
+        except Exception as exc:
+            last_err = exc
+            answers = {
+                **(answers or {}),
+                "_instructions": "Your previous JSON violated consistency rules. Output corrected JSON ONLY.",
+                "_previous_json": blocks_raw,
+                "_consistency_violations": [vv.message for vv in (violations if "violations" in locals() else [])],
+            }
+
+    raise HTTPException(status_code=500, detail=f"Guided analysis block validation failed: {last_err}")
 
 
 def _guided_answers_to_requirements(answers: dict, scope: dict) -> dict:

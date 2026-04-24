@@ -1,0 +1,80 @@
+{
+  "analysis_block_1_application_identity": {
+    "app_type": "<<app_type>>",
+    "app_name": "<<app_name_or_null>>",
+    "frontend_framework": "<<frontend_framework_or_null>>",
+    "framework": "<<framework_or_null>>",
+    "language": "<<language_or_null>>",
+    "database_required": "<<true_or_false>>",
+    "database_engine": "<<database_engine_or_null>>",
+    "domain": "<<domain>>"
+  },
+  "analysis_block_2_architecture_pattern": {
+    "pattern": "<<pattern>>",
+    "separate_frontend_backend": "<<true_or_false>>",
+    "multiple_services": "<<true_or_false>>",
+    "api_gateway_required": "<<true_or_false>>",
+    "load_balancer_required": "<<true_or_false>>",
+    "message_queue_required": "<<true_or_false>>",
+    "message_queue_engine": "<<message_queue_engine>>",
+    "cache_required": "<<true_or_false>>",
+    "cache_engine": "<<cache_engine>>"
+  },
+  "analysis_block_3_network_design": {
+    "network_mode": "auto",
+    "vpc_cidr": "10.0.0.0/16",
+    "public_subnet_cidr": "10.0.1.0/24",
+    "private_subnet_cidr": "10.0.2.0/24",
+    "db_subnet_cidr": "10.0.3.0/24",
+    "nat_gateway": "<<true_or_false>>",
+    "admin_cidr_blocks": []
+  },
+  "analysis_block_4_traffic_and_scale": {
+    "concurrent_users_band": "<<concurrent_users_band>>",
+    "data_storage_band": "<<data_storage_band>>",
+    "traffic_pattern": "<<traffic_pattern>>",
+    "expected_growth": "<<true_or_false>>",
+    "resolved_scale": "<<resolved_scale>>"
+  },
+  "analysis_block_5_availability": {
+    "downtime_impact": "<<downtime_impact>>",
+    "single_server_failure_tolerance": "<<true_or_false>>",
+    "disaster_recovery_required": "<<true_or_false>>",
+    "sla_target": "<<sla_target>>",
+    "web_vm_count": "<<1_or_2_or_3>>",
+    "app_vm_count": "<<1_or_2_or_3>>",
+    "db_replica": "<<true_or_false>>",
+    "multi_az": "<<true_or_false>>",
+    "backup_policy": "<<backup_policy>>"
+  },
+  "analysis_block_6_access_and_security": {
+    "public_facing": "<<true_or_false>>",
+    "team_ssh_access": "<<true_or_false>>",
+    "compliance_requirements": ["<<one_or_more_compliance_items>>"],
+    "handles_sensitive_data": "<<true_or_false>>",
+    "sensitive_data_types": ["<<one_or_more_sensitive_data_items>>"],
+    "bastion_required": "<<true_or_false>>",
+    "waf_required": "<<true_or_false>>",
+    "encryption_at_rest": true,
+    "encryption_in_transit": true,
+    "audit_log_required": "<<true_or_false>>",
+    "tls_version": "<<tls_version>>"
+  },
+  "analysis_block_7_resource_sizing_and_budget": {
+    "vm_size_preference": "<<vm_size_preference>>",
+    "monthly_budget_ceiling_usd": "<<number_or_null>>",
+    "environment": "<<environment>>",
+    "web_vm_type": "<<vm_type>>",
+    "app_vm_type": "<<vm_type>>",
+    "db_vm_type": "<<vm_type>>",
+    "db_storage_gb": "<<db_storage_gb>>",
+    "cost_estimate_monthly_inr": "<<number_or_null>>",
+    "cost_optimised_variant_available": "<<true_or_false>>"
+  },
+  "confidence": {
+    "overall": "<<high_or_medium_or_low>>",
+    "low_confidence_fields": ["<<field_paths>>"],
+    "reasoning": "<<one_sentence>>"
+  }
+}
+
